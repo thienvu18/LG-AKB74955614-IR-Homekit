@@ -1,0 +1,11 @@
+#ifndef _ACESSORY_H_
+#define _ACESSORY_H_
+
+extern homekit_characteristic_t ac_active;
+extern homekit_characteristic_t ac_light;
+extern homekit_characteristic_t current_temperature;
+extern homekit_characteristic_t current_heater_cooler_state;
+extern homekit_characteristic_t target_heater_cooler_state;
+extern homekit_characteristic_t cooling_threshold_temperature;
+
+#endif // _ACESSORY_H_
