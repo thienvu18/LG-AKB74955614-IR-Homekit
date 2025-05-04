@@ -1,7 +1,11 @@
 #include <IRremoteESP8266.h>
+#include <IRrecv.h>
 #include <ir_LG.h>
 #include "arduino_homekit_server.h"
 #include "wifi_info.h"
+
+const uint16_t kCaptureBufferSize = 1024;
+const uint8_t kTimeout = 15;
 
 //access the config defined in C code
 extern "C" homekit_server_config_t config;
@@ -13,8 +17,10 @@ extern "C" homekit_characteristic_t target_heater_cooler_state;
 extern "C" homekit_characteristic_t cooling_threshold_temperature;
 
 IRLgAc ac(4);
+IRrecv irrecv(14, kCaptureBufferSize, kTimeout, true);
 
 bool commandWaiting = false;
+decode_results results;
 
 void notify_changed() {
   homekit_characteristic_notify(&ac_active, ac_active.value);
@@ -111,6 +117,9 @@ void setup() {
   ac.setModel(lg_ac_remote_model_t::AKB74955603);
   ac.begin();
 
+  // Setup IR receive
+  irrecv.enableIRIn();  // Start the receiver
+
   // Setup Homekit
   // homekit_server_reset(); // Always reset for testing purpose
   ac_active.setter = ac_active_setter;
@@ -132,5 +141,11 @@ void loop() {
     delay(10);
 
     commandWaiting = false;
+  }
+
+  if (irrecv.decode(&results)) {
+    if  (results->decode_type == LG2) {
+      
+    }
   }
 }
