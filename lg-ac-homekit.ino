@@ -123,14 +123,21 @@ void setup() {
 }
 
 void loop() {
+  // Check WiFi connection and reconnect if needed
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected, reconnecting...");
+    wifi_connect();
+  }
+
   arduino_homekit_loop();
-  delay(10);
+  yield(); // Feed watchdog timer
 
   if (commandWaiting) {
     Serial.printf("Send IR...\n");
     ac.send();
-    delay(10);
-
+    yield(); // Feed watchdog after IR send
     commandWaiting = false;
   }
+
+  delay(10);
 }

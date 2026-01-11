@@ -16,12 +16,22 @@ void wifi_connect()
   WiFi.begin(ssid, password);
 
   Serial.println("WiFi connecting...");
-  while (!WiFi.isConnected())
+  int attempts = 0;
+  while (!WiFi.isConnected() && attempts < 200)
   {
     delay(50);
     Serial.print(".");
+    attempts++;
+    yield(); // Feed watchdog
   }
   Serial.print("\n");
+
+  if (!WiFi.isConnected())
+  {
+    Serial.println("WiFi failed to connect, restarting...");
+    delay(1000);
+    ESP.restart();
+  }
 
   Serial.print("Connected to ");
   Serial.println(WiFi.SSID()); // WiFi
