@@ -100,13 +100,13 @@ void cooling_threshold_temperature_setter(const homekit_value_t value) {
 }
 
 void ac_light_setter(const homekit_value_t value) {
-  uint8_t state = value.uint8_value;
+  bool state = value.bool_value;
   #if PRINT_DEBUG
-  INFO("ac_light: %f\n", state);
+  INFO("ac_light: %d\n", state);
   #endif
 
   ac.setLight(state);
-  ac_light.value = HOMEKIT_UINT8(state);
+  ac_light.value = HOMEKIT_BOOL(state);
 
   notify_changed();
 }
