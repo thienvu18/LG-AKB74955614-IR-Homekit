@@ -3,6 +3,9 @@
 #include "arduino_homekit_server.h"
 #include "wifi_info.h"
 
+// Debug mode - set to 0 to disable debug printing
+#define PRINT_DEBUG 1
+
 //access the config defined in C code
 extern "C" homekit_server_config_t config;
 extern "C" homekit_characteristic_t ac_active;
@@ -55,7 +58,9 @@ void turn_ac_off() {
 
 void ac_active_setter(const homekit_value_t value) {
   bool on = value.uint8_value == 1;
+  #if PRINT_DEBUG
   INFO("ac_active: %d\n", on);
+  #endif
 
   if (on) {
     turn_ac_on();
@@ -68,7 +73,9 @@ void ac_active_setter(const homekit_value_t value) {
 
 void target_heater_cooler_state_setter(const homekit_value_t value) {
   uint8_t state = value.uint8_value;
+  #if PRINT_DEBUG
   INFO("target_heater_cooler_state: %d\n", state);
+  #endif
 
   if (state != 2) {
     turn_ac_off();
@@ -81,7 +88,9 @@ void target_heater_cooler_state_setter(const homekit_value_t value) {
 
 void cooling_threshold_temperature_setter(const homekit_value_t value) {
   float ctemp = value.float_value;
+  #if PRINT_DEBUG
   INFO("cooling_threshold_temperature: %f\n", ctemp);
+  #endif
 
   ac.setTemp(ctemp);
   cooling_threshold_temperature.value = HOMEKIT_FLOAT(ctemp);
@@ -92,7 +101,9 @@ void cooling_threshold_temperature_setter(const homekit_value_t value) {
 
 void ac_light_setter(const homekit_value_t value) {
   uint8_t state = value.uint8_value;
+  #if PRINT_DEBUG
   INFO("ac_light: %f\n", state);
+  #endif
 
   ac.setLight(state);
   ac_light.value = HOMEKIT_UINT8(state);
@@ -123,21 +134,32 @@ void setup() {
 }
 
 void loop() {
-  // Check WiFi connection and reconnect if needed
+  static unsigned long lastReconnectAttempt = 0;
+
+  // Check WiFi connection and reconnect if needed (throttled to prevent memory fragmentation)
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi disconnected, reconnecting...");
-    wifi_connect();
+    unsigned long now = millis();
+    if (now - lastReconnectAttempt > 30000) { // Try once every 30 seconds
+      #if PRINT_DEBUG
+      Serial.println("WiFi disconnected, reconnecting...");
+      #endif
+      wifi_connect();
+      lastReconnectAttempt = now;
+    }
+    delay(10);
+  } else {
+    arduino_homekit_loop();
+    yield(); // Feed watchdog timer
+
+    if (commandWaiting) {
+      #if PRINT_DEBUG
+      Serial.printf("Send IR...\n");
+      #endif
+      ac.send();
+      yield(); // Feed watchdog after IR send
+      commandWaiting = false;
+    }
+
+    delay(10);
   }
-
-  arduino_homekit_loop();
-  yield(); // Feed watchdog timer
-
-  if (commandWaiting) {
-    Serial.printf("Send IR...\n");
-    ac.send();
-    yield(); // Feed watchdog after IR send
-    commandWaiting = false;
-  }
-
-  delay(10);
 }
