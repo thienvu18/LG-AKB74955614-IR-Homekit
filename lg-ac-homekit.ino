@@ -1,242 +1,370 @@
-#include <IRremoteESP8266.h>
-#include <IRrecv.h>
-#include <ir_LG.h>
-#include <IRac.h>
 #include <IRutils.h>
 #include "arduino_homekit_server.h"
 #include "wifi_info.h"
+#include "ac_state.h"
+#include "ir_handler.h"
+#include <user_interface.h>  // For ESP8266 watchdog and reset info
 
-// Debug mode - set to 0 to disable debug printing
-#define PRINT_DEBUG 1
+// Debug mode - disabled for production
 
-// IR Receive configuration
-const uint16_t kRecvPin = 14;  // GPIO 14 for IR receiver (D5 on NodeMCU)
-const uint16_t kCaptureBufferSize = 1024;
-const uint8_t kTimeout = 50;  // 50ms for A/C protocols
+/* =========================
+ * Hardware Watchdog Configuration
+ * ========================= */
+#define WATCHDOG_TIMEOUT_MS 5000  // 5 seconds - reset if loop takes longer
+static bool watchdog_enabled = false;
 
-//access the config defined in C code
+/* =========================
+ * 24/7 Operation Configuration
+ * ========================= */
+#define PERIODIC_SYNC_INTERVAL_MS 60000   // 1 minute - sync state to HomeKit
+#define HEAP_LOG_INTERVAL_MS 300000       // 5 minutes - log free heap
+#define WIFI_RECONNECT_MAX_RETRIES 10     // Max retries before force restart
+#define WIFI_RECONNECT_INTERVAL_MS 30000  // 30 seconds between retries
+#define MIN_FREE_HEAP_THRESHOLD 15000     // Restart if heap drops below 15KB
+
+static unsigned long wifi_reconnect_count = 0;
+static unsigned long last_periodic_sync = 0;
+static unsigned long last_heap_log = 0;
+static unsigned long boot_time = 0;
+
+/* =========================
+ * Watchdog Functions
+ * ========================= */
+void init_watchdog(void) {
+  // Initialize hardware watchdog
+  ESP.wdtEnable(WATCHDOG_TIMEOUT_MS);
+  watchdog_enabled = true;
+  boot_time = millis();
+}
+
+void feed_watchdog(void) {
+  if (watchdog_enabled) {
+    ESP.wdtFeed();
+  }
+}
+
+/* =========================
+ * 24/7 Helper Functions
+ * ========================= */
+
+// Check for low memory and restart if critical
+void check_memory_threshold(void) {
+  uint32_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < MIN_FREE_HEAP_THRESHOLD) {
+    delay(1000);
+    ESP.restart();
+  }
+}
+
+// Periodic tasks for 24/7 reliability
+void periodic_tasks(unsigned long now) {
+  // Periodic state sync to HomeKit (ensure UI matches reality)
+  if (now - last_periodic_sync > PERIODIC_SYNC_INTERVAL_MS) {
+    sync_homekit_characteristics();
+    last_periodic_sync = now;
+  }
+
+  // Periodic serial flush to prevent buffer overflow
+  if (now - last_heap_log > HEAP_LOG_INTERVAL_MS) {
+    Serial.flush();
+    last_heap_log = now;
+  }
+}
+
+/* =========================
+ * Access HomeKit Characteristics
+ * (defined in accessory.c)
+ * ========================= */
 extern "C" homekit_server_config_t config;
 extern "C" homekit_characteristic_t ac_active;
 extern "C" homekit_characteristic_t ac_light;
-extern "C" homekit_characteristic_t current_temperature;
 extern "C" homekit_characteristic_t current_heater_cooler_state;
 extern "C" homekit_characteristic_t target_heater_cooler_state;
 extern "C" homekit_characteristic_t cooling_threshold_temperature;
+extern "C" homekit_characteristic_t cooling_rotation_speed;
+extern "C" homekit_characteristic_t fan_active;
+extern "C" homekit_characteristic_t fan_rotation_speed;
+extern "C" homekit_characteristic_t dehumidifier_active;
+extern "C" homekit_characteristic_t dehumidifier_rotation_speed;
 
-IRLgAc ac(4);  // GPIO 4 for IR transmitter (D2 on NodeMCU)
-IRrecv irrecv(kRecvPin, kCaptureBufferSize, kTimeout, true);
-
-bool commandWaiting = false;
+/* =========================
+ * IR Objects (defined in ir_handler.c)
+ * ========================= */
+extern IRLgAc ac;
+extern IRrecv irrecv;
 decode_results results;
 
-void notify_changed() {
-  homekit_characteristic_notify(&ac_active, ac_active.value);
-  homekit_characteristic_notify(&ac_light, ac_light.value);
-  homekit_characteristic_notify(&current_temperature, current_temperature.value);
-  homekit_characteristic_notify(&current_heater_cooler_state, current_heater_cooler_state.value);
-  homekit_characteristic_notify(&target_heater_cooler_state, target_heater_cooler_state.value);
-  homekit_characteristic_notify(&cooling_threshold_temperature, cooling_threshold_temperature.value);
-
-  commandWaiting = true;
-}
-
-// Update HomeKit state from received IR command (without triggering IR send)
-void update_homekit_from_ir(IRLgAc &receivedAc) {
-#if PRINT_DEBUG
-  Serial.println("IR received - updating HomeKit state");
-#endif
-
-  // Check if AC is on or off
-  if (receivedAc.getPower()) {
-    // AC is ON
-    ac_active.value = HOMEKIT_UINT8(1);
-    current_heater_cooler_state.value = HOMEKIT_UINT8(3);  // Cooling
-    target_heater_cooler_state.value = HOMEKIT_UINT8(2);   // Cool mode
-
-    // Get temperature from received command
-    uint8_t temp = receivedAc.getTemp();
-    cooling_threshold_temperature.value = HOMEKIT_FLOAT(temp);
-    current_temperature.value = HOMEKIT_FLOAT(temp);
-
-#if PRINT_DEBUG
-    Serial.printf("IR: AC ON, Temp: %d\n", temp);
-#endif
-  } else {
-    // AC is OFF
-    ac_active.value = HOMEKIT_UINT8(0);
-    current_heater_cooler_state.value = HOMEKIT_UINT8(0);  // Inactive
-
-#if PRINT_DEBUG
-    Serial.println("IR: AC OFF");
-#endif
-  }
-
-  // Update our internal AC state to match
-  ac.setRaw(receivedAc.getRaw());
-
-  // Notify HomeKit of the changes (but DON'T set commandWaiting)
-  homekit_characteristic_notify(&ac_active, ac_active.value);
-  homekit_characteristic_notify(&current_temperature, current_temperature.value);
-  homekit_characteristic_notify(&current_heater_cooler_state, current_heater_cooler_state.value);
-  homekit_characteristic_notify(&target_heater_cooler_state, target_heater_cooler_state.value);
-  homekit_characteristic_notify(&cooling_threshold_temperature, cooling_threshold_temperature.value);
-
-  // DON'T set commandWaiting = true here, as we don't want to send IR back
-}
-
-void turn_ac_on() {
-  ac.on();
-  ac.setMode(kLgAcCool);
-
-  if (cooling_threshold_temperature.value.is_null) {
-    ac.setTemp(27);
-    current_temperature.value = HOMEKIT_FLOAT(27);
-    cooling_threshold_temperature.value = HOMEKIT_FLOAT(27);
-  } else {
-    float temp = cooling_threshold_temperature.value.float_value;
-    ac.setTemp(temp);
-    current_temperature.value = HOMEKIT_FLOAT(temp);
-  }
-
-  ac_active.value = HOMEKIT_UINT8(1);
-  current_heater_cooler_state.value = HOMEKIT_UINT8(3);
-  target_heater_cooler_state.value = HOMEKIT_UINT8(2);
-}
-
-void turn_ac_off() {
-  ac.off();
-
-  ac_active.value = HOMEKIT_UINT8(0);
-  current_heater_cooler_state.value = HOMEKIT_UINT8(0);
-}
+/* =========================
+ * HomeKit Setters
+ * ========================= */
 
 void ac_active_setter(const homekit_value_t value) {
+  // HomeKit ACTIVE: 0=Off, 1=On
   bool on = value.uint8_value == 1;
-#if PRINT_DEBUG
-  INFO("ac_active: %d\n", on);
-#endif
 
   if (on) {
-    turn_ac_on();
+    // Power ON: switch to COOL mode, preserve temp/fan, light ON
+    ac_state_set(MODE_COOL, true,
+                 internal_state.target_temp,
+                 internal_state.fan_speed,
+                 true,  // Light always ON with mode change (LG behavior)
+                 SOURCE_HOMEKIT);
   } else {
-    turn_ac_off();
+    // Power OFF: idle in current mode, light OFF
+    ac_state_set(internal_state.mode, false,
+                 internal_state.target_temp,
+                 internal_state.fan_speed,
+                 false,  // Light OFF
+                 SOURCE_HOMEKIT);
   }
-
-  notify_changed();
 }
 
 void target_heater_cooler_state_setter(const homekit_value_t value) {
+  // TargetHeaterCoolerState: 0=Auto, 1=Heat, 2=Cool
+  // We only support COOL (2) - all other values ignored
   uint8_t state = value.uint8_value;
-#if PRINT_DEBUG
-  INFO("target_heater_cooler_state: %d\n", state);
-#endif
 
-  if (state != 2) {
-    turn_ac_off();
-  } else {
-    turn_ac_on();
+  if (state == 2) {  // 2 = Cool mode
+    ac_state_set(MODE_COOL, internal_state.active,
+                 internal_state.target_temp,
+                 internal_state.fan_speed,
+                 true,  // Light ON
+                 SOURCE_HOMEKIT);
   }
-
-  notify_changed();
 }
 
 void cooling_threshold_temperature_setter(const homekit_value_t value) {
-  float ctemp = value.float_value;
-#if PRINT_DEBUG
-  INFO("cooling_threshold_temperature: %f\n", ctemp);
-#endif
+  // HomeKit sends float (18.0-30.0), LG AC uses uint8_t (16-30)
+  float temp = value.float_value;
 
-  ac.setTemp(ctemp);
-  cooling_threshold_temperature.value = HOMEKIT_FLOAT(ctemp);
-  current_temperature.value = HOMEKIT_FLOAT(ctemp);
+  // Only valid in COOL mode
+  if (internal_state.mode == MODE_COOL) {
+    // Round to nearest integer: 24.4->24, 24.5->25 (C standard truncation + 0.5)
+    uint8_t rounded_temp = (uint8_t)(temp + 0.5f);
+    ac_state_set(MODE_COOL, internal_state.active,
+                 rounded_temp,
+                 internal_state.fan_speed,
+                 true,  // Light turns ON with any command (LG behavior)
+                 SOURCE_HOMEKIT);
+  }
+}
 
-  notify_changed();
+void cooling_rotation_speed_setter(const homekit_value_t value) {
+  float speed = value.float_value;
+
+  // Only valid in COOL mode
+  if (internal_state.mode == MODE_COOL) {
+    ac_state_set(MODE_COOL, internal_state.active,
+                 internal_state.target_temp,
+                 (uint8_t)speed,
+                 true,  // Light turns ON
+                 SOURCE_HOMEKIT);
+  }
+}
+
+void fan_active_setter(const homekit_value_t value) {
+  // Fan ACTIVE: 0=Off, 1=On
+  bool on = value.uint8_value == 1;
+
+  if (on) {
+    // Fan ON: switch to FAN mode
+    ac_state_set(MODE_FAN, true,
+                 internal_state.target_temp,
+                 internal_state.fan_speed,
+                 true,
+                 SOURCE_HOMEKIT);
+  } else {
+    // Fan OFF: switch to idle COOL (mode exclusivity)
+    ac_state_set(MODE_COOL, false,
+                 internal_state.target_temp,
+                 internal_state.fan_speed,
+                 false,
+                 SOURCE_HOMEKIT);
+  }
+}
+
+void fan_rotation_speed_setter(const homekit_value_t value) {
+  float speed = value.float_value;
+
+  // Only valid in FAN mode
+  if (internal_state.mode == MODE_FAN) {
+    ac_state_set(MODE_FAN, internal_state.active,
+                 internal_state.target_temp,
+                 (uint8_t)speed,
+                 true,
+                 SOURCE_HOMEKIT);
+  }
+}
+
+void dehumidifier_active_setter(const homekit_value_t value) {
+  // Dehumidifier ACTIVE: 0=Off, 1=On
+  bool on = value.uint8_value == 1;
+
+  if (on) {
+    // DRY ON: switch to DRY mode
+    ac_state_set(MODE_DRY, true,
+                 internal_state.target_temp,
+                 internal_state.fan_speed,
+                 true,
+                 SOURCE_HOMEKIT);
+  } else {
+    // DRY OFF: switch to idle COOL (mode exclusivity)
+    ac_state_set(MODE_COOL, false,
+                 internal_state.target_temp,
+                 internal_state.fan_speed,
+                 false,
+                 SOURCE_HOMEKIT);
+  }
+}
+
+void dehumidifier_rotation_speed_setter(const homekit_value_t value) {
+  float speed = value.float_value;
+
+  // Only valid in DRY mode
+  if (internal_state.mode == MODE_DRY) {
+    ac_state_set(MODE_DRY, internal_state.active,
+                 internal_state.target_temp,
+                 (uint8_t)speed,
+                 true,
+                 SOURCE_HOMEKIT);
+  }
 }
 
 void ac_light_setter(const homekit_value_t value) {
-  bool state = value.bool_value;
-#if PRINT_DEBUG
-  INFO("ac_light: %d\n", state);
-#endif
+  bool desired_state = value.bool_value;
 
-  ac.setLight(state);
-  ac_light.value = HOMEKIT_BOOL(state);
+  // Update internal state
+  internal_state.light_on = desired_state;
 
-  notify_changed();
+  // Send full IR command with current mode/temp/fan + light state
+  ir_handler_send();
+
+  // Sync ALL HomeKit characteristics (light + current mode state)
+  sync_homekit_characteristics();
 }
 
-void setup() {
-  // Setup Serial
-  Serial.begin(115200);
+// Note: ac_state_set() is defined in ac_state.c and declared in ac_state.h
+// sync_homekit_characteristics() is defined in ac_state.c and declared in ac_state.h
 
-  // Setup Wifi
+/* =========================
+ * Setup
+ * ========================= */
+void setup() {
+  Serial.begin(115200);
+  delay(100);  // Wait for serial to stabilize
+
+  // Initialize watchdog early to catch setup hangs
+  init_watchdog();
+
+  // Setup Wifi - BLOCK until connected or timeout
   wifi_connect();
 
-  // Setup AC IR remote
-  ac.setModel(lg_ac_remote_model_t::AKB74955603);
-  ac.begin();
+  // Verify WiFi is connected (wifi_connect should handle timeout, but double-check)
+  if (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    ESP.restart();  // Force restart
+  }
+  feed_watchdog();  // Reset watchdog after WiFi
 
-  // Setup IR receive
-  irrecv.enableIRIn();  // Start the receiver
+  // Setup IR
+  ir_handler_init();
+  feed_watchdog();
 
-  // Setup Homekit
-  // homekit_server_reset(); // Always reset for testing purpose
+  // Setup HomeKit setters
   ac_active.setter = ac_active_setter;
   ac_light.setter = ac_light_setter;
   target_heater_cooler_state.setter = target_heater_cooler_state_setter;
   cooling_threshold_temperature.setter = cooling_threshold_temperature_setter;
-  arduino_homekit_setup(&config);
+  cooling_rotation_speed.setter = cooling_rotation_speed_setter;
+  fan_active.setter = fan_active_setter;
+  fan_rotation_speed.setter = fan_rotation_speed_setter;
+  dehumidifier_active.setter = dehumidifier_active_setter;
+  dehumidifier_rotation_speed.setter = dehumidifier_rotation_speed_setter;
 
-  WiFi.setSleepMode(WIFI_LIGHT_SLEEP);
+  // Setup HomeKit
+  arduino_homekit_setup(&config);
+  feed_watchdog();
+
+  // WiFi no-sleep for maximum reliability (higher power, but 24/7 stable)
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+
+  // Initialize HomeKit state from internal state
+  ac_state_init();
+  feed_watchdog();
 }
 
+/* =========================
+ * Loop
+ * ========================= */
 void loop() {
-  static unsigned long lastReconnectAttempt = 0;
+  feed_watchdog();  // Reset watchdog at start of each loop
 
-  // Check WiFi connection and reconnect if needed (throttled to prevent memory fragmentation)
+  static unsigned long lastReconnectAttempt = 0;
+  unsigned long now = millis();
+
+  // Check WiFi connection
   if (WiFi.status() != WL_CONNECTED) {
-    unsigned long now = millis();
-    if (now - lastReconnectAttempt > 30000) {  // Try once every 30 seconds
-#if PRINT_DEBUG
-      Serial.println("WiFi disconnected, reconnecting...");
-#endif
+    if (now - lastReconnectAttempt > WIFI_RECONNECT_INTERVAL_MS) {
+      wifi_reconnect_count++;
+
+      // Disable watchdog during WiFi reconnect (can take 10+ seconds)
+      ESP.wdtDisable();
       wifi_connect();
+      ESP.wdtEnable(WATCHDOG_TIMEOUT_MS);
+
+      if (WiFi.status() != WL_CONNECTED) {
+        // Force restart after too many failed attempts (stuck in bad state)
+        if (wifi_reconnect_count >= WIFI_RECONNECT_MAX_RETRIES) {
+          delay(1000);
+          ESP.restart();
+        }
+      } else {
+        wifi_reconnect_count = 0;  // Reset counter on success
+
+        // Force sync after reconnection (HomeKit may have missed updates)
+        sync_homekit_characteristics();
+      }
       lastReconnectAttempt = now;
     }
-    delay(10);
-  } else {
-    arduino_homekit_loop();
-    yield();  // Feed watchdog timer
-
-    if (commandWaiting) {
-#if PRINT_DEBUG
-      Serial.printf("Send IR...\n");
-#endif
-      ac.send();
-      yield();  // Feed watchdog after IR send
-      commandWaiting = false;
-    }
-
-    delay(10);
-
-    // Check for received IR commands from physical remote
-    if (irrecv.decode(&results)) {
-      // Check if it's an LG A/C command
-      if (results.decode_type == decode_type_t::LG || results.decode_type == decode_type_t::LG2) {
-#if PRINT_DEBUG
-        Serial.printf("IR Code received: 0x%llX\n", results.value);
-#endif
-
-        // Create temporary LG AC object to decode the state
-        IRLgAc receivedAc(0);                                             // Dummy pin, we're just using it for decoding
-        receivedAc.setRaw((uint32_t)results.value, results.decode_type);  // Use results.value as uint32_t
-
-        // Update HomeKit state without sending IR back
-        update_homekit_from_ir(receivedAc);
-      }
-
-      yield();
-      irrecv.resume();  // Prepare for the next IR message
-    }
+    // Short delay to prevent tight loop during WiFi issues
+    delay(100);
+    yield();  // Feed watchdog/WiFi during delay
+    return;
   }
+
+  // WiFi is connected
+  if (wifi_reconnect_count > 0) {
+    wifi_reconnect_count = 0;  // Reset on stable connection
+  }
+  lastReconnectAttempt = now;
+
+  feed_watchdog();  // Feed after WiFi check
+
+  // HomeKit loop (important to call regularly)
+  arduino_homekit_loop();
+  feed_watchdog();
+
+  // Process pending IR commands (deferred from setters)
+  ir_send_pending_check();
+  feed_watchdog();
+
+  // Periodic 24/7 maintenance tasks
+  periodic_tasks(now);
+  feed_watchdog();
+
+  // Check for memory leaks and restart proactively if needed
+  check_memory_threshold();
+  feed_watchdog();
+
+  // Check for IR commands from physical remote
+  if (irrecv.decode(&results)) {
+    feed_watchdog();  // IR decode can take time
+    ir_handler_decode(&results);
+    irrecv.resume();  // Prepare for the next IR message
+    feed_watchdog();
+  }
+
+  feed_watchdog();  // Final feed before delay
+  yield();          // Feed watchdog/WiFi
+  delay(10);
 }
